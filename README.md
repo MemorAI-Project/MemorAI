@@ -1,4 +1,4 @@
-# MemorAI - Semantic Memory Assistant
+# MemorAI v1.0 - Semantic Memory Assistant
 
 ## Overview
 
