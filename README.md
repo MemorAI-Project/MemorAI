@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-# MemorAI v1.0 - Semantic Memory Assistant
-=======
 # 🧠 MemorAI v1.1 – Semantic Memory Chatbot
->>>>>>> main
 
 MemorAI is an **AI-powered conversational agent with semantic memory**.
 It uses embeddings, FAISS vector search, and summarization models to store, retrieve, and merge past conversation history, allowing the chatbot to **remember context over long interactions**.
