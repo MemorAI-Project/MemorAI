@@ -1,338 +1,284 @@
-import json
 import os
-import re
-import requests
-import threading
-from datetime import datetime
-from typing import Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
-from sentence_transformers import SentenceTransformer, util
-from keybert import KeyBERT
-import torch
+import json
 import faiss
-from transformers import pipeline,logging as transformers_logging
+import numpy as np
+import torch
+import requests
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from threading import Thread
+
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline, logging as transformers_logging
 transformers_logging.set_verbosity_error()  # Suppress all transformers warnings
 
-# Configuration
+# ---------------- CONFIG ----------------
 API_URL = "http://127.0.0.1:1234/v1/chat/completions"
 MODEL_NAME = "deepseek-r1-distill-qwen-7b"
-MEMORY_FILE = "memory.json"
-MAX_MEMORIES = 100  # Maximum number of memories to retain
-SIMILARITY_THRESHOLD = 0.7  # For memory merging
+MAX_MEMORIES = 100
+SIMILARITY_THRESHOLD = 0.7
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MEMORY_FILE = "memory.json"
 
+# ---------------- MEMORY CLASS ----------------
 class MemoryManager:
-    def __init__(self):
-        self.memory = self._load_memory()
-        self.kw_model = KeyBERT(model="paraphrase-MiniLM-L3-v2")
-        self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
-        self._init_faiss_index()
-        
-        self.summarizer = pipeline(
-            "summarization",
-            model="t5-small",
-            device=DEVICE,
-            torch_dtype=torch.float16 if DEVICE == "cuda" else None
-        )
-    
-    def _init_faiss_index(self):
-        self.faiss_index = faiss.IndexFlatL2(384)  # Dimension for all-MiniLM-L6-v2
-        if self.memory["summaries"]:
-            embeddings = [self._get_embedding(mem["content"]) for mem in self.memory["summaries"]]
-            self.faiss_index.add(embeddings)
-    
-    @lru_cache(maxsize=100)
-    def _get_embedding(self, text: str) -> List[float]:
-        return self.embedding_model.encode(text)
-    
-    def _load_memory(self) -> Dict:
-        if os.path.exists(MEMORY_FILE):
-            with open(MEMORY_FILE, 'r') as f:
-                return json.load(f)
-        return {"summaries": []}
-      
-    def save(self):
-        with open(MEMORY_FILE, 'w') as f:
-            json.dump(self.memory, f, indent=2)
-    
-    def clean_for_memory(self, text: str) -> str:
-        """Remove <think> tags and sanitize input"""
-        clean_text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
-        return re.sub(r'[^\w\s.,?;:\'"!@#$%^&*()\-+=]', '', clean_text)[:1000]
-    
-    def _extract_keywords(self, text: str) -> List[str]:
-        """Enhanced keyword extraction with MMR diversity"""
+    def __init__(self, embed_model, file_path=MEMORY_FILE):
+        self.embed_model = embed_model
+        self.file_path = file_path
+        self.memories = []
+        self.faiss_index = None
+        # sentence-transformers provides this helper
         try:
-            keywords = self.kw_model.extract_keywords(
-                text,
-                keyphrase_ngram_range=(1, 2),
-                stop_words="english",
-                use_mmr=True,
-                diversity=0.5,
-                top_n=8
-            )
-            return [kw[0] for kw in keywords if kw[1] > 0.2]  # Confidence threshold
+            self.embedding_dim = int(self.embed_model.get_sentence_embedding_dimension())
+        except Exception:
+            # fallback to known dim for all-MiniLM-L6-v2
+            self.embedding_dim = 384
+        self._load_memory()
+
+    def _load_memory(self):
+        """Load memory from disk, handle empty/corrupt files and migrate simple formats."""
+        try:
+            if os.path.exists(self.file_path):
+                if os.path.getsize(self.file_path) > 0:
+                    with open(self.file_path, "r", encoding="utf-8") as f:
+                        raw = json.load(f)
+                    # handle older formats: if file is list of strings, convert
+                    migrated = []
+                    for item in raw:
+                        if isinstance(item, str):
+                            migrated.append({
+                                "timestamp": datetime.now().isoformat(),
+                                "content": item,
+                                "embedding": self._safe_embed_to_list(item)
+                            })
+                        elif isinstance(item, dict) and "content" in item:
+                            # if embedding exists but as list, keep; if missing, compute
+                            if "embedding" not in item or not item["embedding"]:
+                                item["embedding"] = self._safe_embed_to_list(item["content"])
+                            migrated.append(item)
+                        else:
+                            # unknown item -> skip
+                            continue
+                    self.memories = migrated
+                else:
+                    # empty file -> start with empty list
+                    self.memories = []
+            else:
+                # file doesn't exist
+                self.memories = []
+        except json.JSONDecodeError:
+            print("Warning: memory file is corrupted or empty — starting with blank memory.")
+            self.memories = []
         except Exception as e:
-            print(f"Keyword extraction error: {e}")
+            print(f"Warning: unexpected error loading memory: {e}")
+            self.memories = []
+
+        # ensure file exists as a valid JSON file
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(self.memories, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+        self._rebuild_faiss_index()
+
+    def _save_memory(self):
+        try:
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(self.memories, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[Error] Failed to save memory: {e}")
+
+    def _rebuild_faiss_index(self):
+        # create fresh index and add existing embeddings (if any)
+        try:
+            self.faiss_index = faiss.IndexFlatL2(self.embedding_dim)
+            if self.memories:
+                embeddings = [m["embedding"] for m in self.memories]
+                arr = np.array(embeddings, dtype="float32")
+                if arr.size > 0:
+                    self.faiss_index.add(arr)
+        except Exception as e:
+            print(f"[Error] Rebuilding FAISS index: {e}")
+            # if rebuilding fails, set index to empty index with correct dim
+            self.faiss_index = faiss.IndexFlatL2(self.embedding_dim)
+
+    def _safe_embed_to_list(self, text):
+        """Return embedding as Python list (float) for JSON storage."""
+        try:
+            emb = self.embed_model.encode(text)
+            # ensure numpy array
+            emb_arr = np.array(emb, dtype="float32").flatten()
+            return emb_arr.tolist()
+        except Exception as e:
+            print(f"[Warning] embedding failed: {e}")
+            # fallback to zeros
+            return np.zeros(self.embedding_dim, dtype="float32").tolist()
+
+    def embed_text(self, text):
+        """Return numpy float32 1-D embedding for use with FAISS/search."""
+        emb = self.embed_model.encode(text)
+        return np.array(emb, dtype="float32").flatten()
+
+    def search(self, query, top_k=3):
+        """Return top-k memory items whose distance passes the threshold check."""
+        if not self.memories or self.faiss_index is None:
             return []
-
-    def _summarize_chunk(self, chunk: str) -> str:
-        """Helper for parallel summarization"""
-        return self.summarizer(
-            chunk,
-            max_length=150,
-            min_length=30,
-            do_sample=False
-        )[0]['summary_text']
-    
-    def generate_summary(self, conversation: List[Dict]) -> str:
-        """Hybrid summarization pipeline with parallel processing"""
+        query_emb = np.array([self.embed_text(query)], dtype="float32")
         try:
-            # 1. Create clean conversation text
-            clean_convo = '\n'.join(
-                f"{msg['role']}: {self.clean_for_memory(msg['content'])}" 
-                for msg in conversation
-            )
-            
-            # 2. Extract keywords
-            keywords = self._extract_keywords(clean_convo)
-            
-            # 3. Parallel extractive summarization
-            chunks = [clean_convo[i:i+1000] for i in range(0, len(clean_convo), 1000)]
-            
-            with ThreadPoolExecutor() as executor:
-                extractive_summaries = list(executor.map(self._summarize_chunk, chunks))
-            
-            intermediate_summary = ' '.join(extractive_summaries)
-            
-            # 4. Abstractive refinement with main LLM
-            prompt = (
-                "Create a concise summary using these keywords: "
-                f"{', '.join(keywords)}\n\n"
-                f"Text: {intermediate_summary}\n\n"
-                "Summary should be under 100 words:"
-            )
-            
-            response = requests.post(API_URL, json={
-                "model": MODEL_NAME,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3
-            })
-            
-            if response.status_code != 200:
-                raise ConnectionError(f"API failed: {response.text}")
-                
-            response_data = response.json()
-            if "choices" not in response_data:
-                raise ValueError("Invalid API response structure")
-            
-            return self.clean_for_memory(
-                response_data["choices"][0]["message"]["content"].strip()
-            )
-            
+            distances, indices = self.faiss_index.search(query_emb, top_k)
         except Exception as e:
-            print(f"Summarization error: {e}")
-            # Fallback: Concatenate first/last parts
-            return f"{conversation[0]['content'][:50]}...{conversation[-1]['content'][-50:]}"
+            print(f"[Error] FAISS search failed: {e}")
+            return []
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx >= 0:
+                # NOTE: distances are L2. The numeric threshold semantics depend on your embeddings.
+                # Here we reuse the pattern: consider a match if dist < (1 - SIMILARITY_THRESHOLD)
+                # This mirrors previous usage; adjust if you want cosine similarity instead.
+                if dist < (1.0 - SIMILARITY_THRESHOLD):
+                    results.append(self.memories[idx])
+        return results
 
+    def add_or_merge_memory(self, summary):
+        embedding = self.embed_text(summary)
+        query_emb = np.array([embedding], dtype="float32")
+        if self.memories and self.faiss_index is not None and self.faiss_index.ntotal > 0:
+            try:
+                distances, indices = self.faiss_index.search(query_emb, 1)
+                if distances[0][0] < (SIMILARITY_THRESHOLD):
+                    # merge: update existing entry content and timestamp
+                    idx = int(indices[0][0])
+                    self.memories[idx]["content"] = summary
+                    self.memories[idx]["timestamp"] = datetime.now().isoformat()
+                    self.memories[idx]["embedding"] = embedding.tolist()
+                else:
+                    self.memories.append({
+                        "timestamp": datetime.now().isoformat(),
+                        "content": summary,
+                        "embedding": embedding.tolist()
+                    })
+            except Exception as e:
+                # if search fails for some reason, append
+                print(f"[Warning] FAISS search failed during add/merge: {e}")
+                self.memories.append({
+                    "timestamp": datetime.now().isoformat(),
+                    "content": summary,
+                    "embedding": embedding.tolist()
+                })
+        else:
+            # no existing memories -> append
+            self.memories.append({
+                "timestamp": datetime.now().isoformat(),
+                "content": summary,
+                "embedding": embedding.tolist()
+            })
+
+        # cap memory size (simple FIFO)
+        if len(self.memories) > MAX_MEMORIES:
+            self.memories = self.memories[-int(MAX_MEMORIES * 0.9):]
+
+        self._save_memory()
+        self._rebuild_faiss_index()
+
+# ---------------- AI CLASS ----------------
 class MemorAI:
     def __init__(self):
-        self.memory = MemoryManager()
-        self.chat_history = []
-    
-    def get_context(self, message: str) -> str:
-        """Semantic context retrieval using FAISS"""
-        if not self.memory.memory["summaries"]:
-            return ""
-            
-        query_embedding = self.memory._get_embedding(message)
-        _, indices = self.memory.faiss_index.search(
-            query_embedding.reshape(1, -1), 
-            k=3  # Top 3 most similar
-        )
-        
-        context = []
-        for idx in indices[0]:
-            if idx < len(self.memory.memory["summaries"]):
-                context.append(self.memory.memory["summaries"][idx]["content"])
-        
-        return '\n\n'.join(context) if context else ""
-    
-    def chat(self, message: str):
-        """Process user input with async memory updates"""
-        if message.lower() == "/memory":
-            self.show_memory_preview()
-            return
-            
-        # Get context using semantic search
-        context = self.get_context(message)
-        
-        # Prepare messages
-        messages = [{"role": "user", "content": message}]
+        print("MemorAI - Embedding-Only Semantic Memory Version")
+        # load embedding model
+        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2", device=DEVICE)
+        self.memory = MemoryManager(self.embed_model, file_path=MEMORY_FILE)
+        # summarizer device: 0 for cuda, -1 for cpu
+        summarizer_device = 0 if DEVICE == "cuda" else -1
+        self.summarizer = pipeline("summarization", model="t5-small", device=summarizer_device)
+
+    def _generate_summary(self, text):
+        if not text or not text.strip():
+            return None
+        try:
+            extractive = self.summarizer(text, max_length=60, min_length=10, do_sample=False)[0]["summary_text"]
+        except Exception as e:
+            print(f"[Warning] extractive summarizer failed: {e}")
+            # fallback: truncate text
+            extractive = text.strip()[:400]
+        prompt = f"Summarize this text in under 100 words:\n\n{extractive}"
+        try:
+            resp = requests.post(API_URL, json={
+                "model": MODEL_NAME,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.5
+            }, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+            summary = data["choices"][0]["message"]["content"].strip()
+            return summary
+        except Exception as e:
+            print(f"[Error] Abstractive summarization failed, using extractive fallback: {e}")
+            return extractive
+
+    def _update_memory(self, conversation_text):
+        summary = self._generate_summary(conversation_text)
+        if summary:
+            self.memory.add_or_merge_memory(summary)
+
+    def chat(self, user_input):
+        context = self.memory.search(user_input)
+        messages = []
         if context:
-            messages.insert(0, {"role": "system", "content": context})
-        
-        # Stream response
-        print("AI: ", end="", flush=True)
-        full_response = ""
-        
+            context_text = "\n".join([m["content"] for m in context])
+            messages.append({
+        "role": "system",
+        "content": (
+            "You are an AI assistant with memory. "
+            "Here are notes from past interactions with the user. "
+            "Always use them to answer questions, especially if the user asks what you remember:\n\n"
+            f"{context_text}\n\n" 
+        )
+    })
+        messages.append({"role": "user", "content": user_input})
+
+        reply = ""
         try:
             with requests.post(API_URL, json={
                 "model": MODEL_NAME,
                 "messages": messages,
                 "temperature": 0.7,
                 "stream": True
-            }, stream=True) as resp:
-                
-                for line in resp.iter_lines():
+            }, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                for line in r.iter_lines():
+                    if not line:
+                        continue
                     if line.startswith(b"data: "):
-                        data = line[6:]
-                        if data.strip() == b"[DONE]":
+                        data_str = line[len(b"data: "):].decode("utf-8")
+                        if data_str.strip() == "[DONE]":
                             break
                         try:
-                            chunk = json.loads(data)
-                            content = chunk["choices"][0]["delta"].get("content", "")
-                            print(content, end="", flush=True)
-                            full_response += content
+                            data = json.loads(data_str)
+                            delta = data["choices"][0]["delta"].get("content", "")
+                            if delta:
+                                print(delta, end="", flush=True)
+                                reply += delta
                         except json.JSONDecodeError:
                             continue
-                print("\n")
-                
+                print()
         except Exception as e:
-            error_msg = f"\n[Error] {e}"
-            print(error_msg)
-            full_response = error_msg
-        
-        # Async memory update
-        threading.Thread(
-            target=self._update_memory,
-            args=(message, full_response),
-            daemon=True
-        ).start()
-    
-    def _update_memory(self, user_msg: str, ai_response: str):
-        """Optimized memory update with semantic merging"""
-        conversation = [
-            {"role": "user", "content": user_msg},
-            {"role": "assistant", "content": ai_response}
-        ]
-        
-        # Generate summary
-        summary = self.memory.generate_summary(conversation)
-        summary_embedding = self.memory._get_embedding(summary)
-        
-        # Find similar existing memory
-        existing_idx = None
-        if self.memory.memory["summaries"]:
-            distances, indices = self.memory.faiss_index.search(
-                summary_embedding.reshape(1, -1), 
-                k=1
-            )
-            if distances[0][0] < (1 - SIMILARITY_THRESHOLD):
-                existing_idx = indices[0][0]
-        
-        keywords = self.memory._extract_keywords(summary)
-        
-        if existing_idx is not None and existing_idx < len(self.memory.memory["summaries"]):
-            # Merge with existing memory
-            old = self.memory.memory["summaries"][existing_idx]
-            merged_text = f"{old['content']}\n{summary}"
-            
-            merged_summary = self.memory.generate_summary([
-                {"role": "system", "content": merged_text}
-            ])
-            
-            # Update keywords (deduplicate and limit)
-            merged_keywords = list(set(old["keywords"] + keywords))
-            if len(merged_keywords) > 10:
-                keyword_scores = {
-                    kw: (old["keywords"].count(kw) * 2 + 
-                         (1 if kw.lower() in merged_summary.lower() else 0)
-                    for kw in merged_keywords)
-                }
-                merged_keywords = sorted(
-                    keyword_scores.keys(),
-                    key=lambda x: keyword_scores[x],
-                    reverse=True
-                )[:10]
-            
-            # Update memory entry
-            self.memory.memory["summaries"][existing_idx] = {
-                "timestamp": datetime.now().isoformat(),
-                "content": merged_summary,
-                "keywords": merged_keywords,
-                "embedding": self.memory._get_embedding(merged_summary).tolist()
-            }
-            
-            # Update FAISS index
-            self.memory.faiss_index.remove_ids(existing_idx)
-            self.memory.faiss_index.add(
-                self.memory._get_embedding(merged_summary).reshape(1, -1)
-            )
-            
-        else:
-            # Add new memory
-            new_memory = {
-                "timestamp": datetime.now().isoformat(),
-                "content": summary,
-                "keywords": keywords[:10],  # Enforce limit
-                "embedding": summary_embedding.tolist()
-            }
-            
-            self.memory.memory["summaries"].append(new_memory)
-            
-            # Update FAISS index
-            self.memory.faiss_index.add(summary_embedding.reshape(1, -1))
-            
-            # Enforce memory limit
-            if len(self.memory.memory["summaries"]) > MAX_MEMORIES:
-                self.memory.memory["summaries"] = sorted(
-                    self.memory.memory["summaries"],
-                    key=lambda x: x["timestamp"],
-                    reverse=True
-                )[:int(MAX_MEMORIES * 0.9)]
-                self._rebuild_faiss_index()
-        
-        self.memory.save()
-    
-    def _rebuild_faiss_index(self):
-        """Recreate FAISS index after major changes"""
-        self.memory.faiss_index.reset()
-        embeddings = [
-            self.memory._get_embedding(mem["content"]) 
-            for mem in self.memory.memory["summaries"]
-        ]
-        if embeddings:
-            self.memory.faiss_index.add(embeddings)
-    
-    def show_memory_preview(self):
-        """Display memory overview to user"""
-        print("\n=== Memory Preview ===")
-        for i, mem in enumerate(self.memory.memory["summaries"][:5]):
-            print(f"{i+1}. {mem['content'][:80]}... (Keywords: {', '.join(mem['keywords'][:3])})")
-        print(f"\nTotal memories: {len(self.memory.memory['summaries'])}/{MAX_MEMORIES}")
-        print("=====================\n")
+            print(f"[Error] Chat failed: {e}")
 
-def main():
-    print("MemorAI - Enhanced Semantic Memory Version")
-    print("Type 'exit' to quit or '/memory' to view memory\n")
-    
-    ai = MemorAI()
-    
-    while True:
-        try:
-            user_input = input("You: ").strip()
-            if not user_input:
-                continue
-            if user_input.lower() in ("exit", "quit"):
-                break
-            ai.chat(user_input)
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            break
-        except Exception as e:
-            print(f"\nError: {e}. Continuing...")
+        # asynchronously update memory with the short conversation
+        Thread(target=self._update_memory, args=(f"User: {user_input}\nAssistant: {reply}",), daemon=True).start()
 
+# ---------------- MAIN LOOP ---------------- #
 if __name__ == "__main__":
-    main()
+    bot = MemorAI()
+    print("Type 'exit' to quit or '/memory' to view memory\n")
+    while True:
+        user_input = input("You: ")
+        if user_input.lower() == "exit":
+            break
+        elif user_input.strip() == "/memory":
+            for m in bot.memory.memories:
+                print(f"[{m['timestamp']}] {m['content']}\n")
+        else:
+            print("AI: ", end="", flush=True)
+            bot.chat(user_input)

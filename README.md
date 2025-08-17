@@ -1,95 +1,132 @@
+<<<<<<< HEAD
 # MemorAI v1.0 - Semantic Memory Assistant
+=======
+# 🧠 MemorAI v1.1 – Semantic Memory Chatbot
+>>>>>>> main
 
-## Overview
+MemorAI is an **AI-powered conversational agent with semantic memory**.
+It uses embeddings, FAISS vector search, and summarization models to store, retrieve, and merge past conversation history, allowing the chatbot to **remember context over long interactions**.
 
-MemorAI is an advanced conversational AI assistant with long-term semantic memory capabilities. It uses a hybrid approach of extractive and abstractive summarization combined with semantic search to maintain and retrieve relevant context from past conversations.
+---
 
-Key features:
-- Persistent memory storage in JSON format
-- Semantic search using FAISS vector database
-- Hybrid summarization pipeline (extractive + abstractive)
-- Keyword extraction with KeyBERT
-- Memory merging based on semantic similarity
-- Streaming chat responses
+## 🚀 Features
 
-## Technical Components
+- **Semantic Memory**: Stores conversations in vector embeddings using [Sentence Transformers](https://www.sbert.net/).
+- **Vector Search with FAISS**: Finds the most relevant past context for each user query.
+- **Summarization Pipeline**: Extractive + abstractive summarization for compact memory storage.
+- **Memory Management**:
 
-### Core Technologies
-- **Language Model**: Integrates with local LLM API (default: deepseek-r1-distill-qwen-7b)
-- **Embeddings**: Uses `all-MiniLM-L6-v2` from SentenceTransformers
-- **Vector Database**: FAISS for efficient similarity search
-- **Keyword Extraction**: KeyBERT with paraphrase-MiniLM-L3-v2
-- **Summarization**: T5-small for extractive summarization + LLM for abstractive refinement
+  - Merges similar memories automatically.
+  - Caps memory size and prunes older entries.
+  - Persists memory in `memory.json`.
 
-### Memory Management
-- Stores conversation summaries with timestamps and keywords
-- Automatically merges similar memories
-- Enforces maximum memory limit with LRU-like eviction
-- Semantic search for context retrieval
+- **Streaming Chat**: Integrates with a local LLM server (`http://127.0.0.1:1234/v1/chat/completions`) for streaming responses.
 
-## Installation
+---
 
-### Prerequisites
-- Python 3.8+
-- CUDA-enabled GPU recommended
-- Local LLM API endpoint (default expects http://127.0.0.1:1234/v1/chat/completions)
+## 📦 Installation
 
-### Setup
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/memorai.git
-   cd memorai
-   ```
+### 1. Clone the repo
 
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Configure the API endpoint in `main.py` if needed:
-   ```python
-   API_URL = "http://your-api-endpoint/v1/chat/completions"
-   MODEL_NAME = "your-model-name"
-   ```
-
-## Usage
-
-Run the assistant:
 ```bash
-python main.py
+git clone https://github.com/yourusername/MemorAI.git
+cd MemorAI
+```
+
+### 2. Create and activate a virtual environment
+
+```bash
+python -m venv .venv
+source .venv/bin/activate   # On Linux/Mac
+.venv\Scripts\activate      # On Windows
+```
+
+### 3. Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+**requirements.txt** (suggested):
+
+```
+faiss-cpu
+numpy
+torch
+requests
+sentence-transformers
+transformers
+```
+
+---
+
+## ⚙️ Configuration
+
+Edit these variables at the top of the script if needed:
+
+```python
+API_URL = "http://127.0.0.1:1234/v1/chat/completions"  # Your local LLM API
+MODEL_NAME = "deepseek-r1-distill-qwen-7b"             # Model name for chat API
+MAX_MEMORIES = 100                                     # Max number of stored memories
+SIMILARITY_THRESHOLD = 0.7                             # Memory merge threshold
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MEMORY_FILE = "memory.json"
+```
+
+---
+
+## ▶️ Usage
+
+Run the chatbot:
+
+```bash
+python MemorAI.py
+```
+
+You’ll see:
+
+```
+MemorAI - Embedding-Only Semantic Memory Version
+Type 'exit' to quit or '/memory' to view memory
 ```
 
 ### Commands
-- Regular chat: Just type your message
-- View memory: `/memory`
-- Exit: `exit` or `quit`
 
-## Configuration
+- **Normal input** → Chat with the AI.
+- **/memory** → Display stored memory entries.
+- **exit** → Quit the program.
 
-Modify these constants in `main.py` as needed:
+---
 
-```python
-API_URL = "http://127.0.0.1:1234/v1/chat/completions"  # Your LLM API endpoint
-MODEL_NAME = "deepseek-r1-distill-qwen-7b"            # Model name
-MEMORY_FILE = "memory.json"                           # Memory storage file
-MAX_MEMORIES = 100                                    # Maximum memories to retain
-SIMILARITY_THRESHOLD = 0.7                            # Similarity threshold for merging
+## 🛠️ How It Works
+
+1. **User sends input**
+2. AI searches FAISS for relevant past context.
+3. Context is injected into the system prompt.
+4. LLM generates a response (streaming).
+5. Conversation is summarized and stored in memory.
+6. Similar entries are merged; old ones pruned.
+
+---
+
+## 📂 Project Structure
+
+```
+MemorAI/
+│── MemorAI.py       # Main script
+│── memory.json      # Persistent memory store
+│── requirements.txt # Dependencies
+│── README.md        # Documentation
 ```
 
-## Performance Notes
+---
 
-- The system is optimized for GPU usage (automatically detects CUDA)
-- FAISS index is kept in memory for fast retrieval
-- Embeddings are cached with LRU strategy
-- Memory updates happen asynchronously to avoid blocking chat
+## 📝 Example
 
-## Customization
+```
+You: hi
+AI: Hello! How can I help you today?
 
-To adapt the system:
-1. Change the summarization pipeline in `MemoryManager`
-2. Adjust keyword extraction parameters in `_extract_keywords()`
-3. Modify the memory merging logic in `_update_memory()`
-
-## License
-
-[MIT License](LICENSE)
+You: /memory
+[2025-08-10T14:49:09] User greeted the assistant with "hi" and received a friendly reply.
+```
