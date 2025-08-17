@@ -268,7 +268,7 @@ class MemorAI:
         # asynchronously update memory with the short conversation
         Thread(target=self._update_memory, args=(f"User: {user_input}\nAssistant: {reply}",), daemon=True).start()
 
-# ---------------- MAIN LOOP ---------------- #
+# ---------------- MAIN LOOP ----------------
 if __name__ == "__main__":
     bot = MemorAI()
     print("Type 'exit' to quit or '/memory' to view memory\n")
